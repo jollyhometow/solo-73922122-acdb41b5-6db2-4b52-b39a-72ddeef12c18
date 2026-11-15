@@ -1,0 +1,117 @@
+# 港口地磅称量流：双实例 API + 双分区 Redpanda + PostgreSQL
+# 启动：docker compose up -d --build
+# 文档：http://localhost:8001/docs 或 http://localhost:8002/docs
+name: weighbridge
+
+x-app-common: &app-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: weighbridge-api:1.0.0
+  environment: &app-env
+    DATABASE_URL: postgresql+psycopg2://weigh:weigh@postgres:5432/weighbridge
+    KAFKA_BOOTSTRAP: redpanda:9092
+    BROKER_BACKEND: kafka
+    TOPIC: weighbridge-events
+    TOPIC_PARTITIONS: "2"
+    CONSUMER_GROUP: weighbridge-consumer-group
+    CONSUMER_ENABLED: "true"
+    LOG_LEVEL: INFO
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redpanda:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: weigh
+      POSTGRES_PASSWORD: weigh
+      POSTGRES_DB: weighbridge
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weigh -d weighbridge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --set=redpanda.empty_seed_starts_cluster=true
+      - --set=redpanda.cluster_id=weighbridge-cluster
+      # 双监听器：容器内走 internal（redpanda:9092），宿主机走 external（localhost:19092）
+      - '--set=redpanda.kafka_api=[{name: internal, address: 0.0.0.0, port: 9092},{name: external, address: 0.0.0.0, port: 19092}]'
+      - '--set=redpanda.advertised_kafka_api=[{name: internal, address: redpanda, port: 9092},{name: external, address: localhost, port: 19092}]'
+      - '--set=redpanda.admin_api=[{address: 0.0.0.0, port: 9644}]'
+      - '--set=redpanda.advertised_admin_api=[{address: redpanda, port: 9644}]'
+    ports:
+      - "19092:19092"   # 宿主机 Kafka 协议访问（external 监听器）
+      - "9644:9644"     # Admin API
+    volumes:
+      - rpdata:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --api-urls http://localhost:9644 | grep -q 'Healthy:.*true'"]
+      interval: 8s
+      timeout: 6s
+      retries: 20
+      start_period: 10s
+
+  # 一次性任务：确保双分区 Topic 存在（幂等）
+  topic-init:
+    image: redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        rpk topic create weighbridge-events --brokers redpanda:9092 --partitions 2 --replicas 1 || \
+          rpk topic describe weighbridge-events --brokers redpanda:9092
+        rpk topic list --brokers redpanda:9092
+
+  app-1:
+    <<: *app-common
+    container_name: weighbridge-app-1
+    environment:
+      <<: *app-env
+      INSTANCE_ID: instance-1
+    ports:
+      - "8001:8000"
+
+  app-2:
+    <<: *app-common
+    container_name: weighbridge-app-2
+    environment:
+      <<: *app-env
+      INSTANCE_ID: instance-2
+    ports:
+      - "8002:8000"
+
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
+  rpdata:
